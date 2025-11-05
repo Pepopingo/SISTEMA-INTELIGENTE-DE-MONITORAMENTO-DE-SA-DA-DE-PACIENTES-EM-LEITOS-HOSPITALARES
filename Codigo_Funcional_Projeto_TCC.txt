@@ -1351,4 +1351,5 @@ void smtpCallback(SMTP_Status status) {
     Serial.println("E-mail enviado com sucesso!");
     adicionar_log("EMAIL", "Logs enviados para " + String(EMAIL_RECIPIENT));
   }
+
 }
