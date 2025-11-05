@@ -1,0 +1,1354 @@
+/*
+SISTEMA DE MONITORAMENTO HOSPITALAR - VERSÃO 2.1 - CORRIGIDO
+MELHORIAS: Nome de Paciente Personalizável e Painel de Configuração Web.
+As configurações (fator de calibração, etc.) são salvas na memória NVS do ESP32.
+HARDWARE:
+- ESP32 DevKit v1
+- Display OLED 2.42" SSD1309 (SDA: 21, SCL: 22)
+- Célula de Carga com HX711 (DT: 4, SCK: 16)
+- RTC DS3231 (SDA: 21, SCL: 22)
+- Buzzer Ativo (PIN: 2)
+- Botões (TARA: 12, START/STOP: 14, CADASTRAR: 27, FINALIZAR: 26, HISTÓRICO: 25)
+*/
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <HX711.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+#include <RTClib.h>
+#include <ESP_Mail_Client.h> 
+#include <Preferences.h> 
+
+// =================================================================
+// ===== CORREÇÃO RTC: Descomente a linha abaixo APENAS UMA VEZ =====
+// para forçar o ajuste da hora do RTC com a do seu computador.
+// Depois de carregar o código uma vez, comente a linha novamente
+// e carregue de novo para o RTC manter a hora de forma independente.
+// =================================================================
+//#define FORCE_RTC_SET 
+
+// ===== CONFIGURAÇÕES WIFI ATUALIZADAS =====
+const char* ssid = "GEISON";
+const char* password = "39828490";
+
+// ===== CONFIGURAÇÕES DE E-MAIL =====
+#define EMAIL_SENDER_ACCOUNT    "monitorhospitalar@gmail.com"
+#define EMAIL_SENDER_PASSWORD   "oiawinafmmpcybte"
+#define EMAIL_RECIPIENT         "vmonteiro825@gmail.com"
+#define SMTP_SERVER             "smtp.gmail.com"
+#define SMTP_PORT               465
+
+SMTPSession smtp;
+// ===== DEFINIÇÃO DOS PINOS =====
+#define DT_PIN 4               
+#define SCK_PIN 16             
+#define BTN_TARA 12            
+#define BTN_START_STOP 14      
+#define BTN_CADASTRAR 27       
+#define BTN_FINALIZAR 26       
+#define BTN_HISTORICO 25       
+#define BUZZER_PIN 2       
+#define SDA_PIN 21             
+#define SCL_PIN 22             
+
+// ===== OBJETOS =====
+Adafruit_SSD1306 oled(128, 64, &Wire, -1);
+HX711 balanca;
+WebServer server(80);
+RTC_DS3231 rtc;
+Preferences preferences; 
+
+// ===== CONFIGURAÇÕES DO SISTEMA (AGORA SÃO VARIÁVEIS) =====
+float fator_calibracao = 22239.0;
+float percentual_limite = 70.0;
+float peso_minimo_deteccao = 0.5;          
+float tolerancia_ruido = 0.2;
+
+// ===== ESTRUTURA DE DADOS =====
+struct Paciente {
+  int numero_paciente;
+  float peso_cadastrado;
+  float limite_alerta;
+  bool ativo;
+  DateTime data_cadastro;
+  String nome_paciente;
+};
+
+struct LogEvento {
+  DateTime timestamp;
+  String tipo_evento;
+  String descricao;
+  int paciente_id;
+  float peso_relacionado;
+};
+
+// ===== DADOS DO PACIENTE E LOGS =====
+Paciente paciente_atual = {0, 0.0, 0.0, false, DateTime(), ""};
+int proximo_numero_paciente = 1;
+LogEvento logs_eventos[50];
+int indice_log_atual = 0;
+int total_logs = 0;
+
+// ===== ESTADOS DO SISTEMA =====
+enum Estado { AGUARDANDO, MONITORANDO, ALERTA_ATIVO, VISUALIZANDO_HISTORICO };
+Estado estado_atual = AGUARDANDO;
+
+// ===== VARIÁVEIS GLOBAIS =====
+float peso_atual = 0.0;
+bool monitoramento_ativo = false;
+bool wifi_conectado = false;
+bool rtc_conectado = false;
+String ip_address = "";
+int pagina_historico = 0;
+
+// ===== CONTROLE DE TEMPO E DISPLAY =====
+unsigned long tempo_ultimo_alerta = 0;
+unsigned long tempo_debounce = 0;
+unsigned long tempo_update_display = 0;
+unsigned long tempo_animacao = 0;
+unsigned long tempo_alternancia_instrucoes = 0;
+const unsigned long intervalo_alerta = 2000;    
+const unsigned long debounce_delay = 300;       
+const unsigned long intervalo_display = 300;
+const unsigned long intervalo_animacao = 800;
+const unsigned long intervalo_alternancia = 3000;
+
+// ===== CONTROLE DOS BOTÕES =====
+bool btn_tara_anterior = HIGH;
+bool btn_start_stop_anterior = HIGH;
+bool btn_cadastrar_anterior = HIGH;
+bool btn_finalizar_anterior = HIGH;
+bool btn_historico_anterior = HIGH;
+
+// ===== CONTROLE DE TELA =====
+bool piscar_alerta = false;
+int indice_instrucao_atual = 0;
+
+// ===== DECLARAÇÕES DAS FUNÇÕES =====
+void tocar_alerta();
+void tocar_beep_confirmacao();
+void tocar_beep_duplo();
+void tocar_beep_erro();
+void tocar_beep_navegacao();
+void inicializar_rtc();
+// A linha abaixo está correta, com o valor padrão definido apenas aqui.
+void adicionar_log(String tipo, String descricao, float peso = -1);
+String formatar_datetime(DateTime dt);
+String formatar_data_curta(DateTime dt);
+String formatar_hora_curta(DateTime dt);
+DateTime obter_timestamp_atual();
+void desenhar_header_simplificado();
+void desenhar_linha_horizontal(int y);
+void mostrar_tela_inicial();
+void mostrar_tela_cadastro();
+void mostrar_tela_alerta();
+void mostrar_tela_historico();
+void mostrar_operacao_temporaria(String mensagem, int duracao = 1500);
+void atualizar_oled();
+void mostrar_status_wifi(String status, int progresso);
+void mostrar_status_rtc(String status);
+void mostrar_tela_boot();
+void ler_peso();
+void verificar_botoes();
+void executar_logica_sistema();
+void executar_tara();
+void alternar_monitoramento();
+void cadastrar_paciente(String nome);
+void finalizar_sessao();
+void navegar_historico();
+void conectar_wifi();
+void configurar_servidor();
+void handleRoot();
+void handleApiStatus();
+void handleApiTara();
+void handleApiIniciar();
+void handleApiParar();
+void handleApiCadastrar();
+void handleApiFinalizar();
+void handleApiLogs();
+void handleApiExportarEnviarLogs(); 
+void enviar_email_logs(String conteudo_logs);
+void smtpCallback(SMTP_Status status);
+void carregar_configuracoes();
+void salvar_configuracoes();
+void handleApiSalvarConfig();
+
+// ===== SETUP =====
+void setup() {
+  Serial.begin(115200);
+  Serial.println("===========================================================");
+  Serial.println("SISTEMA DE MONITORAMENTO HOSPITALAR V2.1 - CONFIG WEB");
+  Serial.println("===========================================================");
+  
+  pinMode(BTN_TARA, INPUT_PULLUP);
+  pinMode(BTN_START_STOP, INPUT_PULLUP);
+  pinMode(BTN_CADASTRAR, INPUT_PULLUP);
+  pinMode(BTN_FINALIZAR, INPUT_PULLUP);
+  pinMode(BTN_HISTORICO, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  Serial.println("✓ Pinos configurados");
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);         
+  Serial.println("✓ I2C inicializado");
+
+  Serial.println("Inicializando OLED...");
+  if(!oled.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("Tentando endereço 0x3D...");
+    if(!oled.begin(SSD1306_SWITCHCAPVCC, 0x3D)) {
+      Serial.println("ERRO: OLED não encontrado!");
+      while(1) { tocar_beep_erro(); delay(2000); }
+    }
+  }
+  oled.setTextWrap(false);
+  mostrar_tela_boot();
+  Serial.println("✓ OLED inicializado");
+  
+  carregar_configuracoes();
+  inicializar_rtc();
+  conectar_wifi();
+
+  Serial.println("Inicializando HX711...");
+  balanca.begin(DT_PIN, SCK_PIN);
+  balanca.set_scale(fator_calibracao);
+  balanca.tare();
+  Serial.println("✓ HX711 inicializado e zerado");
+  
+  adicionar_log("SISTEMA", "Sistema inicializado com sucesso");
+  configurar_servidor();
+
+  delay(2000);
+  estado_atual = AGUARDANDO;
+  Serial.println("🏥 SISTEMA PRONTO PARA OPERAÇÃO!");
+  tocar_beep_confirmacao();
+}
+
+// ===== LOOP PRINCIPAL =====
+void loop() {
+  ler_peso();
+  verificar_botoes();
+  executar_logica_sistema();
+  if (wifi_conectado) {
+    server.handleClient();
+  }
+  
+  if (millis() - tempo_update_display > intervalo_display) {
+    atualizar_oled();
+    tempo_update_display = millis();
+  }
+  
+  if (millis() - tempo_animacao > intervalo_animacao) {
+    piscar_alerta = !piscar_alerta;
+    tempo_animacao = millis();
+  }
+  
+  delay(50);
+}
+
+// ===== FUNÇÕES DE CONFIGURAÇÃO (NVS) =====
+void carregar_configuracoes() {
+  preferences.begin("monitor-conf", false);
+  fator_calibracao = preferences.getFloat("fator_cal", 22239.0);
+  percentual_limite = preferences.getFloat("perc_limite", 70.0);
+  peso_minimo_deteccao = preferences.getFloat("peso_min", 0.5);
+  proximo_numero_paciente = preferences.getInt("prox_pac", 1);
+  preferences.end();
+  Serial.println("✓ Configurações carregadas da NVS.");
+  Serial.println("  - Fator Calibração: " + String(fator_calibracao));
+  Serial.println("  - Percentual Limite: " + String(percentual_limite));
+  Serial.println("  - Peso Mínimo: " + String(peso_minimo_deteccao));
+}
+
+void salvar_configuracoes() {
+  preferences.begin("monitor-conf", false);
+  preferences.putFloat("fator_cal", fator_calibracao);
+  preferences.putFloat("perc_limite", percentual_limite);
+  preferences.putFloat("peso_min", peso_minimo_deteccao);
+  preferences.putInt("prox_pac", proximo_numero_paciente);
+  preferences.end();
+  Serial.println("✓ Configurações salvas na NVS.");
+  
+  balanca.set_scale(fator_calibracao);
+  
+  if (paciente_atual.ativo) {
+    paciente_atual.limite_alerta = paciente_atual.peso_cadastrado * (percentual_limite / 100.0);
+  }
+}
+
+// ===== CADASTRAR PACIENTE =====
+void cadastrar_paciente(String nome) {
+  if (peso_atual >= peso_minimo_deteccao) {
+    paciente_atual.numero_paciente = proximo_numero_paciente++;
+    paciente_atual.peso_cadastrado = peso_atual;
+    paciente_atual.limite_alerta = peso_atual * (percentual_limite / 100.0);
+    paciente_atual.ativo = true;
+    paciente_atual.data_cadastro = obter_timestamp_atual();
+    
+    if (nome.isEmpty() || nome.length() > 20) {
+      paciente_atual.nome_paciente = "Paciente_" + String(paciente_atual.numero_paciente);
+    } else {
+      paciente_atual.nome_paciente = nome;
+    }
+    
+    salvar_configuracoes();
+    mostrar_operacao_temporaria("PACIENTE CADASTRADO");
+    
+    adicionar_log("PACIENTE", "Cadastrado: " + paciente_atual.nome_paciente + " (#" + String(paciente_atual.numero_paciente) + ") - " + String(peso_atual, 1) + "kg", peso_atual);
+    adicionar_log("CONFIG", "Limite alerta: " + String(paciente_atual.limite_alerta, 1) + "kg (" + String(percentual_limite, 0) + "%)");
+    
+    tocar_beep_confirmacao();
+  } else {
+    mostrar_operacao_temporaria("PESO INSUFICIENTE");
+    adicionar_log("ERRO", "Cadastro rejeitado - Peso " + String(peso_atual, 1) + "kg < " + String(peso_minimo_deteccao, 1) + "kg", peso_atual);
+    tocar_beep_erro();
+  }
+}
+
+// ===== VERIFICAR BOTÕES =====
+void verificar_botoes() {
+  if (millis() - tempo_debounce < debounce_delay) return;
+  
+  bool btn_tara_atual = digitalRead(BTN_TARA);
+  if (btn_tara_atual == LOW && btn_tara_anterior == HIGH) {
+    executar_tara();
+    tempo_debounce = millis();
+  }
+  btn_tara_anterior = btn_tara_atual;
+
+  bool btn_start_stop_atual = digitalRead(BTN_START_STOP);
+  if (btn_start_stop_atual == LOW && btn_start_stop_anterior == HIGH) {
+    alternar_monitoramento();
+    tempo_debounce = millis();
+  }
+  btn_start_stop_anterior = btn_start_stop_atual;
+
+  bool btn_cadastrar_atual = digitalRead(BTN_CADASTRAR);
+  if (btn_cadastrar_atual == LOW && btn_cadastrar_anterior == HIGH) {
+    if (!monitoramento_ativo) {
+      cadastrar_paciente("");
+    } else {
+      tocar_beep_erro();
+    }
+    tempo_debounce = millis();
+  }
+  btn_cadastrar_anterior = btn_cadastrar_atual;
+  
+  bool btn_finalizar_atual = digitalRead(BTN_FINALIZAR);
+  if (btn_finalizar_atual == LOW && btn_finalizar_anterior == HIGH) {
+    finalizar_sessao();
+    tempo_debounce = millis();
+  }
+  btn_finalizar_anterior = btn_finalizar_atual;
+
+  bool btn_historico_atual = digitalRead(BTN_HISTORICO);
+  if (btn_historico_atual == LOW && btn_historico_anterior == HIGH) {
+    navegar_historico();
+    tempo_debounce = millis();
+  }
+  btn_historico_anterior = btn_historico_atual;
+}
+
+
+// ===== MOSTRAR TELA CADASTRO =====
+void mostrar_tela_cadastro() {
+  oled.clearDisplay();
+  desenhar_header_simplificado();
+  oled.setTextColor(WHITE);
+  oled.setTextSize(1);
+  oled.setCursor(0, 12);
+  
+  String nome_display = paciente_atual.nome_paciente;
+  if (nome_display.length() > 21) {
+    nome_display = nome_display.substring(0, 21);
+  }
+  oled.print(nome_display);
+
+  oled.setTextSize(2);
+  String peso_atual_str = String(peso_atual, 1) + "kg";
+  int x_pos = (128 - (peso_atual_str.length() * 12)) / 2;
+  oled.setCursor(max(0, x_pos), 24);
+  oled.print(peso_atual_str);
+  
+  oled.setTextSize(1);
+  oled.setCursor(0, 40);
+  oled.print("Limite: ");
+  oled.print(paciente_atual.limite_alerta, 1);
+  oled.print("kg (");
+  oled.print(percentual_limite, 0);
+  oled.print("%)");
+
+  desenhar_linha_horizontal(50);
+  
+  oled.setCursor(0, 53);
+  oled.print("Monitor:");
+  if (monitoramento_ativo) {
+    oled.setTextColor(BLACK, WHITE);
+    oled.setCursor(58, 53);
+    oled.print(" ATIVO ");
+  } else {
+    oled.setTextColor(WHITE);
+    oled.setCursor(58, 53);
+    oled.print(" PARADO");
+  }
+  oled.display();
+}
+
+// ===== CONFIGURAR SERVIDOR WEB =====
+void configurar_servidor() {
+  if (!wifi_conectado) {
+    adicionar_log("REDE", "Servidor web não iniciado - WiFi desconectado");
+    return;
+  }
+  server.on("/", handleRoot);
+  server.on("/api/status", handleApiStatus);
+  server.on("/api/tara", HTTP_POST, handleApiTara);
+  server.on("/api/iniciar", HTTP_POST, handleApiIniciar);
+  server.on("/api/parar", HTTP_POST, handleApiParar);
+  server.on("/api/cadastrar", HTTP_POST, handleApiCadastrar);
+  server.on("/api/finalizar", HTTP_POST, handleApiFinalizar);
+  server.on("/api/logs", handleApiLogs);
+  server.on("/api/exportar-e-enviar-logs", HTTP_POST, handleApiExportarEnviarLogs); 
+  server.on("/api/salvar-config", HTTP_POST, handleApiSalvarConfig);
+  server.enableCORS(true);
+  server.begin();
+  Serial.println("✓ Servidor web iniciado");
+  Serial.println("Acesse: http://" + ip_address);
+  adicionar_log("REDE", "Servidor web iniciado - http://" + ip_address);
+}
+
+// ===== HANDLERS WEB =====
+void handleRoot() {
+  String html = F(R"(
+<!DOCTYPE html>
+<html lang='pt-BR'>
+<head>
+    <meta charset='UTF-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <title>Monitor Hospitalar Inteligente</title>
+    <style>
+        :root {
+            --primary-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            --success-gradient: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+            --warning-gradient: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            --danger-gradient: linear-gradient(135deg, #fc466b 0%, #3f5efb 100%);
+            --info-gradient: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            --dark-gradient: linear-gradient(135deg, #434343 0%, #000000 100%);
+            --bg-main: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            --card-bg: rgba(255, 255, 255, 0.95);
+            --text-primary: #2c3e50;
+            --text-secondary: #7f8c8d;
+            --border-color: rgba(255, 255, 255, 0.2);
+            --shadow-main: 0 8px 32px rgba(0, 0, 0, 0.12);
+            --shadow-hover: 0 12px 40px rgba(0, 0, 0, 0.18);
+            --font-primary: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+            --border-radius: 16px;
+            --transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: var(--font-primary); background: var(--bg-main); color: var(--text-primary); line-height: 1.6; min-height: 100vh; overflow-x: hidden; }
+        .container { max-width: 1400px; margin: 0 auto; padding: 2rem 1rem; display: grid; gap: 2rem; grid-template-columns: repeat(1, 1fr); }
+        @media (min-width: 768px) { .container { grid-template-columns: repeat(2, 1fr); padding: 2rem; } }
+        @media (min-width: 1200px) { .container { grid-template-columns: repeat(3, 1fr); } }
+        .card { background: var(--card-bg); border-radius: var(--border-radius); box-shadow: var(--shadow-main); padding: 2rem; transition: var(--transition); backdrop-filter: blur(10px); border: 1px solid var(--border-color); position: relative; overflow: hidden; }
+        .card::before { content: ''; position: absolute; top: 0; left: 0; width: 100%; height: 4px; background: var(--primary-gradient); }
+        .card:hover { transform: translateY(-4px); box-shadow: var(--shadow-hover); }
+        .full-width { grid-column: 1 / -1; }
+        .header-card { text-align: center; background: var(--primary-gradient); color: white; padding: 3rem 2rem; }
+        .header-card h1 { font-size: 2.5rem; font-weight: 700; margin-bottom: 0.5rem; text-shadow: 0 2px 4px rgba(0, 0, 0, 0.3); }
+        .header-card .subtitle { font-size: 1.2rem; opacity: 0.9; font-weight: 300; }
+        .card-header { display: flex; align-items: center; gap: 1rem; margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 2px solid #f8f9fa; }
+        .card-header h2 { font-size: 1.4rem; font-weight: 600; color: var(--text-primary); }
+        .icon { width: 28px; height: 28px; opacity: 0.8; }
+        .status-card { text-align: center; position: relative; }
+        .status-card.alerta { background: linear-gradient(135deg, #fff5f5, #fed7d7); border: 2px solid #fc8181; animation: pulse-alert 1.5s infinite; }
+        .status-card.alerta::before { background: var(--danger-gradient); }
+        .status-card.monitorando::before { background: var(--success-gradient); }
+        @keyframes pulse-alert { 0%, 100% { box-shadow: 0 0 0 0 rgba(252, 129, 129, 0.4); } 50% { box-shadow: 0 0 0 15px rgba(252, 129, 129, 0); } }
+        .status-text { font-size: 1.8rem; font-weight: 700; margin-bottom: 1.5rem; text-transform: uppercase; letter-spacing: 1px; }
+        .status-text.alerta { color: #e53e3e; animation: blink 1s infinite; }
+        .status-text.monitorando { color: #38a169; }
+        .status-text.aguardando { color: var(--text-secondary); }
+        @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0.3; } }
+        .peso-display { font-size: 4rem; font-weight: 800; background: var(--primary-gradient); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; margin-bottom: 1rem; font-family: 'Courier New', monospace; }
+        .datetime { font-size: 1.1rem; color: var(--text-secondary); font-weight: 500; }
+        .paciente-info { position: relative; }
+        .paciente-info.ativo::before { background: var(--success-gradient); }
+        .placeholder { text-align: center; color: var(--text-secondary); padding: 3rem 1rem; font-style: italic; }
+        .paciente-info ul { list-style: none; padding: 0; }
+        .paciente-info li { display: flex; justify-content: space-between; align-items: center; padding: 1rem 0; border-bottom: 1px solid #f1f3f4; transition: var(--transition); }
+        .paciente-info li:hover { background: rgba(103, 126, 234, 0.05); margin: 0 -2rem; padding: 1rem 2rem; border-radius: 8px; }
+        .paciente-info li:last-child { border-bottom: none; }
+        .paciente-info .label { font-weight: 600; color: var(--text-primary); }
+        .paciente-info .value { font-weight: 500; color: var(--text-secondary); background: #f8f9fa; padding: 0.25rem 0.75rem; border-radius: 20px; font-size: 0.9rem; max-width: 60%; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;}
+        .controls-grid { display: grid; grid-template-columns: 1fr; gap: 1rem; }
+        .cadastro-section { display: grid; grid-template-columns: 1fr auto; gap: 1rem; margin-bottom: 1rem; }
+        .input-field { width: 100%; padding: 1rem; font-size: 1rem; border: 2px solid #e2e8f0; border-radius: 12px; transition: var(--transition); }
+        .input-field:focus { border-color: #667eea; box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.2); outline: none; }
+        .btn { padding: 1rem 1.5rem; font-size: 1rem; font-weight: 600; border: none; border-radius: 12px; cursor: pointer; transition: var(--transition); display: flex; align-items: center; justify-content: center; gap: 0.75rem; color: white; text-transform: uppercase; letter-spacing: 0.5px; position: relative; overflow: hidden; }
+        .btn::before { content: ''; position: absolute; top: 0; left: -100%; width: 100%; height: 100%; background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent); transition: left 0.6s; }
+        .btn:hover::before { left: 100%; }
+        .btn:hover { transform: translateY(-3px); box-shadow: 0 8px 25px rgba(0, 0, 0, 0.15); }
+        .btn:active { transform: translateY(-1px); }
+        .btn-cadastrar { background: var(--primary-gradient); box-shadow: 0 4px 15px rgba(103, 126, 234, 0.4); }
+        .btn-monitor { background: var(--success-gradient); box-shadow: 0 4px 15px rgba(56, 239, 125, 0.4); }
+        .btn-monitor.stop { background: var(--danger-gradient); box-shadow: 0 4px 15px rgba(252, 70, 107, 0.4); }
+        .btn-tara { background: var(--warning-gradient); box-shadow: 0 4px 15px rgba(245, 87, 108, 0.4); }
+        .btn-finalizar { background: var(--info-gradient); box-shadow: 0 4px 15px rgba(79, 172, 254, 0.4); }
+        .btn-save { background: var(--success-gradient); box-shadow: 0 4px 15px rgba(56, 239, 125, 0.4); }
+        .btn-export { background: var(--info-gradient); box-shadow: 0 4px 15px rgba(79, 172, 254, 0.4); }
+        .btn-email { background: var(--dark-gradient); box-shadow: 0 4px 15px rgba(67, 67, 67, 0.4); }
+        .logs-section, .config-section { grid-column: 1 / -1; }
+        .config-grid { display: grid; gap: 1rem; }
+        .config-item { display: flex; flex-direction: column; }
+        .config-item label { margin-bottom: 0.5rem; font-weight: 600; color: var(--text-secondary); }
+        .logs-actions { display: flex; gap: 1rem; margin-bottom: 1.5rem; flex-wrap: wrap; }
+        .toast { position: fixed; bottom: 30px; right: 30px; padding: 1rem 1.5rem; background: rgba(0, 0, 0, 0.9); color: white; border-radius: 12px; backdrop-filter: blur(10px); box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3); z-index: 1000; opacity: 0; visibility: hidden; transform: translateX(100%); transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1); }
+        .toast.show { opacity: 1; visibility: visible; transform: translateX(0); }
+        .toast.error { background: var(--danger-gradient); }
+        .toast.success { background: var(--success-gradient); }
+        .fade-in { animation: fadeIn 0.6s ease-out; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+        .logs-container { max-height: 500px; overflow-y: auto; }
+        .log-entry { margin-bottom: 1rem; padding: 1rem; border-radius: 12px; background: #f8f9fa; border-left: 4px solid; }
+        .log-entry.ALERTA { border-left-color: #fc8181; } .log-entry.MONITOR { border-left-color: #68d391; } .log-entry.PACIENTE { border-left-color: #4299e1; } .log-entry.ERRO { border-left-color: #f687b3; } .log-entry.SISTEMA { border-left-color: #9f7aea; } .log-entry.REDE { border-left-color: #38b2ac; } .log-entry.SESSAO { border-left-color: #ed8936; } .log-entry.CONFIG { border-left-color: #805ad5; } .log-entry.RETORNO { border-left-color: #48bb78; }
+        .log-header { display: flex; justify-content: space-between; }
+        .log-tipo { font-weight: 700; }
+    </style>
+</head>
+<body>
+    <div class='container'>
+        <header class='card header-card full-width fade-in'>
+            <h1>🏥 Monitor Hospitalar Inteligente V2.1</h1>
+            <p class='subtitle'>Sistema com Configuração Web e Nomes Personalizados</p>
+        </header>
+        <main class='card status-card fade-in' id='status-card'>
+            <div class='card-header'><h2>Status do Sistema</h2></div>
+            <div class='status-text' id='status-text'>Iniciando...</div>
+            <div class='peso-display' id='peso-atual'>-.- kg</div>
+            <div class='datetime' id='datetime-atual'>--/--/---- --:--:--</div>
+        </main>
+        <aside class='card paciente-info fade-in' id='paciente-card'>
+            <div class='card-header'><h2>Paciente Atual</h2></div>
+            <div id='paciente-dados'><div class='placeholder'>Aguardando cadastro...</div></div>
+        </aside>
+        <section class='card controls fade-in'>
+            <div class='card-header'><h2>Controles do Sistema</h2></div>
+            <div class='controls-grid'>
+                <div class='cadastro-section'>
+                    <input type='text' id='nome_paciente_input' class='input-field' placeholder='Nome do Paciente (Opcional)'>
+                    <button class='btn btn-cadastrar' onclick='cadastrarPacienteAction()'>Cadastrar</button>
+                </div>
+                <button class='btn btn-monitor' id='btn-monitor' onclick='toggleMonitor()'><span id='monitor-text'>Iniciar</span></button>
+                <button class='btn btn-tara' onclick='sendAction("/api/tara")'>Tara</button>
+                <button class='btn btn-finalizar' onclick='finalizarSessao()'>Finalizar</button>
+            </div>
+        </section>
+        <section class='card config-section fade-in'>
+            <div class='card-header'><h2>Configurações do Monitor</h2></div>
+            <div class='config-grid'>
+                <div class='config-item'>
+                    <label for='percentual_limite_input'>Percentual Limite de Alerta (%)</label>
+                    <input type='number' step='1' id='percentual_limite_input' class='input-field'>
+                </div>
+                <div class='config-item'>
+                    <label for='peso_minimo_input'>Peso Mínimo para Detecção (kg)</label>
+                    <input type='number' step='0.1' id='peso_minimo_input' class='input-field'>
+                </div>
+                <button class='btn btn-save' onclick='salvarConfigAction()'>Salvar Configurações</button>
+            </div>
+        </section>
+        <section class='card logs-section fade-in'>
+            <div class='card-header'><h2>Registro de Eventos</h2></div>
+            <div class='logs-actions'>
+                <button class='btn btn-export' onclick='exportLogsAction()'>Exportar (.txt)</button>
+                <button class='btn btn-email' onclick='sendEmailAction()'>Enviar por E-mail</button>
+            </div>
+            <div class='logs-container' id='logs-container'><div class='placeholder'>Carregando...</div></div>
+        </section>
+    </div>
+    <div id='toast' class='toast'></div>
+    <script>
+        document.addEventListener('DOMContentLoaded', () => { updateStatus(); setInterval(updateStatus, 2000); });
+        let isMonitoring = false;
+        async function updateStatus() {
+            try {
+                const response = await fetch('/api/status');
+                if (!response.ok) throw new Error('Network response was not ok');
+                const data = await response.json();
+                const statusCard = document.getElementById('status-card');
+                const statusText = document.getElementById('status-text');
+                statusCard.className = 'card status-card fade-in';
+                statusText.className = 'status-text';
+                switch(data.estado) {
+                    case 'ALERTA_ATIVO': statusCard.classList.add('alerta'); statusText.classList.add('alerta'); statusText.textContent = 'ALERTA!'; break;
+                    case 'MONITORANDO': statusCard.classList.add('monitorando'); statusText.classList.add('monitorando'); statusText.textContent = 'MONITORANDO'; break;
+                    default: statusText.classList.add('aguardando'); statusText.textContent = 'AGUARDANDO'; break;
+                }
+                document.getElementById('peso-atual').textContent = data.peso.toFixed(1) + ' kg';
+                document.getElementById('datetime-atual').textContent = data.rtc_conectado ? data.datetime_atual : 'RTC indisponível';
+                const pacienteDiv = document.getElementById('paciente-dados');
+                const pacienteCard = document.getElementById('paciente-card');
+                if (data.paciente.ativo) {
+                    pacienteCard.classList.add('ativo');
+                    pacienteDiv.innerHTML = `<ul>
+                        <li><span class='label'>Nome:</span><span class='value'>${data.paciente.nome}</span></li>
+                        <li><span class='label'>Paciente #:</span><span class='value'>${data.paciente.numero}</span></li>
+                        <li><span class='label'>Peso Cadastrado:</span><span class='value'>${data.paciente.peso_cadastrado.toFixed(1)} kg</span></li>
+                        <li><span class='label'>Limite de Alerta:</span><span class='value'>${data.paciente.limite_alerta.toFixed(1)} kg</span></li>
+                        <li><span class='label'>Data de Cadastro:</span><span class='value'>${data.paciente.data_cadastro || 'N/A'}</span></li>
+                    </ul>`;
+                } else {
+                    pacienteCard.classList.remove('ativo');
+                    pacienteDiv.innerHTML = "<div class='placeholder'>Aguardando cadastro...</div>";
+                }
+                if (document.activeElement.id !== 'percentual_limite_input') {
+                  document.getElementById('percentual_limite_input').value = data.config.percentual_limite;
+                }
+                if (document.activeElement.id !== 'peso_minimo_input') {
+                  document.getElementById('peso_minimo_input').value = data.config.peso_minimo_deteccao;
+                }
+                isMonitoring = data.monitoramento_ativo;
+                document.getElementById('btn-monitor').className = isMonitoring ? 'btn btn-monitor stop' : 'btn btn-monitor';
+                document.getElementById('monitor-text').textContent = isMonitoring ? 'Parar' : 'Iniciar';
+                updateLogs(data.logs);
+            } catch (error) {
+                console.error('Falha ao atualizar status:', error);
+                document.getElementById('status-text').textContent = 'Erro de conexão';
+                showToast('Erro de conexão com o dispositivo', true);
+            }
+        }
+        function updateLogs(logs) {
+            const logsContainer = document.getElementById('logs-container');
+            if (!logs || logs.length === 0) {
+                logsContainer.innerHTML = '<div class="placeholder">Nenhum evento registrado</div>';
+                return;
+            }
+            let logsHtml = '';
+            logs.forEach(log => {
+                logsHtml += `<div class="log-entry ${log.tipo}"><div class="log-header"><span class="log-tipo">${log.tipo}</span><span>${log.timestamp}</span></div><div>${log.descricao}</div></div>`;
+            });
+            logsContainer.innerHTML = logsHtml;
+        }
+        async function sendPostRequest(endpoint, body) {
+            try {
+                const response = await fetch(endpoint, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: new URLSearchParams(body)
+                });
+                const data = await response.json();
+                if (response.ok) {
+                    showToast(data.mensagem || 'Ação executada com sucesso', false);
+                } else {
+                    showToast(data.mensagem || 'Erro ao executar ação', true);
+                }
+                updateStatus();
+            } catch (error) {
+                console.error(`Falha na ação ${endpoint}:`, error);
+                showToast('Erro de comunicação com o dispositivo', true);
+            }
+        }
+        async function cadastrarPacienteAction() {
+            const nome = document.getElementById('nome_paciente_input').value;
+            await sendPostRequest('/api/cadastrar', { nome_paciente: nome });
+            document.getElementById('nome_paciente_input').value = '';
+        }
+        async function salvarConfigAction() {
+            const percentual = document.getElementById('percentual_limite_input').value;
+            const peso_min = document.getElementById('peso_minimo_input').value;
+            await sendPostRequest('/api/salvar-config', { percentual_limite: percentual, peso_minimo_deteccao: peso_min });
+        }
+        async function sendAction(endpoint) { await sendPostRequest(endpoint, {}); }
+        function toggleMonitor() { sendAction(isMonitoring ? '/api/parar' : '/api/iniciar'); }
+        function finalizarSessao() { if (confirm('Tem certeza que deseja finalizar a sessão?')) { sendAction('/api/finalizar'); } }
+        async function exportLogsAction() {
+            try {
+                const response = await fetch('/api/logs');
+                if (!response.ok) throw new Error('Falha ao buscar logs.');
+                const logs = await response.json();
+                let logText = `Relatório de Logs - Monitor Hospitalar\r\nGerado em: ${new Date().toLocaleString('pt-BR')}\r\n\r\n`;
+                logText += "==================================================\r\n\r\n";
+                if (logs.length > 0) {
+                    logs.forEach(log => {
+                        logText += `[${log.timestamp}] [${log.tipo}] ${log.descricao}\r\n`;
+                    });
+                } else {
+                    logText += "Nenhum evento registrado.\r\n";
+                }
+                const blob = new Blob([logText], { type: 'text/plain' });
+                const link = document.createElement('a');
+                link.href = URL.createObjectURL(blob);
+                link.download = `logs_monitor_hospitalar_${new Date().toISOString().slice(0,10)}.txt`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                showToast('Logs exportados com sucesso!', false);
+            } catch(error) {
+                console.error('Erro ao exportar logs:', error);
+                showToast('Erro ao exportar logs.', true);
+            }
+        }
+        function sendEmailAction() {
+            if (confirm('Tem certeza que deseja enviar o relatório de logs por e-mail?')) {
+                sendAction('/api/exportar-e-enviar-logs');
+            }
+        }
+        function showToast(message, isError = false) {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.className = 'toast';
+            toast.classList.add(isError ? 'error' : 'success', 'show');
+            setTimeout(() => toast.classList.remove('show'), 4000);
+        }
+    </script>
+</body>
+</html>
+)");
+  
+  server.send(200, "text/html", html);
+}
+
+// ===== HANDLERS API =====
+void handleApiStatus() {
+  DynamicJsonDocument doc(4096);
+  doc["peso"] = peso_atual;
+  doc["wifi_conectado"] = wifi_conectado;
+  doc["rtc_conectado"] = rtc_conectado;
+  
+  String estado_str = "";
+  switch (estado_atual) {
+    case AGUARDANDO: estado_str = "AGUARDANDO"; break;
+    case MONITORANDO: estado_str = "MONITORANDO"; break;
+    case ALERTA_ATIVO: estado_str = "ALERTA_ATIVO"; break;
+    case VISUALIZANDO_HISTORICO: estado_str = "VISUALIZANDO_HISTORICO"; break;
+  }
+  doc["estado"] = estado_str;
+  doc["monitoramento_ativo"] = monitoramento_ativo;
+  doc["datetime_atual"] = rtc_conectado ? formatar_datetime(rtc.now()) : "RTC indisponível";
+
+  JsonObject paciente = doc.createNestedObject("paciente");
+  paciente["ativo"] = paciente_atual.ativo;
+  paciente["numero"] = paciente_atual.numero_paciente;
+  paciente["nome"] = paciente_atual.nome_paciente;
+  paciente["peso_cadastrado"] = paciente_atual.peso_cadastrado;
+  paciente["limite_alerta"] = paciente_atual.limite_alerta;
+  paciente["data_cadastro"] = (paciente_atual.ativo && rtc_conectado) ? formatar_datetime(paciente_atual.data_cadastro) : "";
+  
+  JsonObject config = doc.createNestedObject("config");
+  config["percentual_limite"] = percentual_limite;
+  config["peso_minimo_deteccao"] = peso_minimo_deteccao;
+  
+  JsonArray logs = doc.createNestedArray("logs");
+  int max_logs = min(50, total_logs);
+  for (int i = 0; i < max_logs; i++) {
+    int indice_real = (indice_log_atual - 1 - i + 50) % 50;
+    LogEvento evento = logs_eventos[indice_real];
+    JsonObject log_json = logs.createNestedObject();
+    log_json["timestamp"] = rtc_conectado ? formatar_datetime(evento.timestamp) : "N/A";
+    log_json["tipo"] = evento.tipo_evento;
+    log_json["descricao"] = evento.descricao;
+  }
+
+  String resposta;
+  serializeJson(doc, resposta);
+  server.send(200, "application/json", resposta);
+}
+
+void handleApiCadastrar() {
+  String nome_paciente = "";
+  if (server.hasArg("nome_paciente")) {
+    nome_paciente = server.arg("nome_paciente");
+  }
+  
+  if (peso_atual >= peso_minimo_deteccao) {
+    cadastrar_paciente(nome_paciente);
+    server.send(200, "application/json", "{\"status\":\"ok\",\"mensagem\":\"Paciente cadastrado com sucesso\"}");
+  } else {
+    adicionar_log("ERRO", "Cadastro via web rejeitado - Peso insuficiente: " + String(peso_atual, 1) + "kg");
+    server.send(400, "application/json", "{\"status\":\"erro\",\"mensagem\":\"Peso insuficiente para cadastro\"}");
+  }
+}
+
+void handleApiSalvarConfig() {
+  if (server.hasArg("percentual_limite")) {
+    percentual_limite = server.arg("percentual_limite").toFloat();
+  }
+  if (server.hasArg("peso_minimo_deteccao")) {
+    peso_minimo_deteccao = server.arg("peso_minimo_deteccao").toFloat();
+  }
+  
+  salvar_configuracoes();
+  adicionar_log("CONFIG", "Configurações atualizadas via web");
+  server.send(200, "application/json", "{\"status\":\"ok\",\"mensagem\":\"Configurações salvas com sucesso!\"}");
+}
+
+// ===== FUNÇÕES RESTANTES =====
+void conectar_wifi() {
+  Serial.print("Conectando ao WiFi ");
+  Serial.println(ssid);
+  mostrar_status_wifi("Conectando", 0);
+  adicionar_log("REDE", "Iniciando conexão WiFi");
+  
+  WiFi.begin(ssid, password);
+  
+  int tentativas = 0;
+  while (WiFi.status() != WL_CONNECTED && tentativas < 20) {
+    delay(500);
+    tentativas++;
+    mostrar_status_wifi("Conectando", tentativas);
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    wifi_conectado = true;
+    ip_address = WiFi.localIP().toString();
+    Serial.println("✓ WiFi conectado - IP: " + ip_address);
+    mostrar_operacao_temporaria("IP: " + ip_address, 3000);
+    adicionar_log("REDE", "WiFi conectado - IP: " + ip_address);
+  } else {
+    wifi_conectado = false;
+    Serial.println("✗ Falha na conexão WiFi");
+    mostrar_status_wifi("WiFi Falhou", -1);
+    adicionar_log("ERRO", "Falha na conexão WiFi");
+    delay(2000);
+  }
+}
+
+void ler_peso() {
+  if (balanca.is_ready()) {
+    float leitura = balanca.get_units(3);
+    if (leitura > -tolerancia_ruido && leitura < tolerancia_ruido) {
+      peso_atual = 0.0;
+    } else {
+      peso_atual = leitura;
+    }
+  }
+}
+
+void executar_tara() {
+  mostrar_operacao_temporaria("ZERANDO BALANCA");
+  balanca.tare();
+  adicionar_log("SISTEMA", "Tara executada");
+  tocar_beep_confirmacao();
+}
+
+void alternar_monitoramento() {
+  if (!monitoramento_ativo) {
+    if (paciente_atual.ativo) {
+      monitoramento_ativo = true;
+      estado_atual = MONITORANDO;
+      adicionar_log("MONITOR", "Monitor INICIADO - Paciente: " + paciente_atual.nome_paciente);
+      tocar_beep_confirmacao();
+    } else {
+      adicionar_log("ERRO", "Tentativa de iniciar monitor sem paciente");
+      tocar_beep_erro();
+    }
+  } else {
+    monitoramento_ativo = false;
+    estado_atual = AGUARDANDO;
+    adicionar_log("MONITOR", "Monitor PAUSADO");
+    tocar_beep_duplo();
+  }
+}
+
+void finalizar_sessao() {
+  if (paciente_atual.ativo) {
+    String log_msg = "Sessão finalizada - Paciente: " + paciente_atual.nome_paciente;
+    if (rtc_conectado) {
+      DateTime agora = obter_timestamp_atual();
+      DateTime inicio = paciente_atual.data_cadastro;
+      long duracao_segundos = agora.unixtime() - inicio.unixtime();
+      long horas = duracao_segundos / 3600;
+      long minutos = (duracao_segundos % 3600) / 60;
+      adicionar_log("SESSAO", log_msg + " - Duração: " + String(horas) + "h" + String(minutos) + "m");
+    } else {
+      adicionar_log("SESSAO", log_msg);
+    }
+  }
+  
+  monitoramento_ativo = false;
+  paciente_atual = {0, 0.0, 0.0, false, DateTime(), ""};
+  estado_atual = AGUARDANDO;
+  pagina_historico = 0;
+  
+  mostrar_operacao_temporaria("SESSAO FINALIZADA");
+  tocar_beep_duplo();
+}
+
+void navegar_historico() {
+  if (estado_atual != VISUALIZANDO_HISTORICO) {
+    estado_atual = VISUALIZANDO_HISTORICO;
+    pagina_historico = 0;
+    adicionar_log("SISTEMA", "Histórico acessado");
+    tocar_beep_navegacao();
+  } else {
+    int total_paginas = (total_logs + 3) / 4;
+    if (pagina_historico < total_paginas - 1) {
+      pagina_historico++;
+      tocar_beep_navegacao();
+    } else {
+      estado_atual = paciente_atual.ativo && monitoramento_ativo ? MONITORANDO : AGUARDANDO;
+      adicionar_log("SISTEMA", "Saiu do histórico");
+      tocar_beep_duplo();
+    }
+  }
+}
+
+void executar_logica_sistema() {
+  if (estado_atual == VISUALIZANDO_HISTORICO) return;
+  if (monitoramento_ativo && paciente_atual.ativo) {
+    static bool ultimo_status_alerta = false;
+    bool status_alerta_atual = (peso_atual < paciente_atual.limite_alerta);
+    if (status_alerta_atual && !ultimo_status_alerta) {
+      estado_atual = ALERTA_ATIVO;
+      adicionar_log("ALERTA", "PACIENTE SAIU! Peso: " + String(peso_atual, 1) + "kg < " + String(paciente_atual.limite_alerta, 1) + "kg", peso_atual);
+    } else if (!status_alerta_atual && ultimo_status_alerta) {
+      estado_atual = MONITORANDO;
+      adicionar_log("RETORNO", "Paciente retornou - Peso: " + String(peso_atual, 1) + "kg", peso_atual);
+    }
+    
+    ultimo_status_alerta = status_alerta_atual;
+    if (estado_atual == ALERTA_ATIVO && millis() - tempo_ultimo_alerta >= intervalo_alerta) {
+      tocar_alerta();
+      tempo_ultimo_alerta = millis();
+    }
+  }
+}
+
+void desenhar_header_simplificado() {
+  oled.setTextSize(1);
+  oled.setTextColor(WHITE);
+  oled.setCursor(0, 0);
+  if (rtc_conectado) {
+    DateTime agora = rtc.now();
+    char buff[9];
+    sprintf(buff, "%02d:%02d:%02d", agora.hour(), agora.minute(), agora.second());
+    oled.print(buff);
+  } else {
+    oled.print("--:--:--");
+  }
+  
+  String wifi_status = wifi_conectado ? "WiFi:ON" : "WiFi:OFF";
+  int largura_wifi = wifi_status.length() * 6;
+  oled.setCursor(128 - largura_wifi, 0);
+  oled.print(wifi_status);
+  
+  desenhar_linha_horizontal(9);
+}
+
+void mostrar_tela_inicial() {
+  oled.clearDisplay();
+  desenhar_header_simplificado();
+  
+  oled.setTextSize(1);
+  oled.setTextColor(WHITE);
+  if (peso_atual >= peso_minimo_deteccao) {
+    oled.setCursor(8, 15);
+    oled.println("PACIENTE DETECTADO");
+  } else {
+    oled.setCursor(24, 15);
+    oled.println("SEM PACIENTE");
+  }
+
+  oled.setTextSize(2);
+  oled.setCursor(0, 28);
+  String peso_str = String(peso_atual, 1);
+  if (peso_str.length() > 5) peso_str = peso_str.substring(0, 5);
+  oled.print(peso_str);
+  oled.setTextSize(1);
+  oled.print(" kg");
+  
+  desenhar_linha_horizontal(42);
+
+  if (millis() - tempo_alternancia_instrucoes > intervalo_alternancia) {
+    indice_instrucao_atual = (indice_instrucao_atual + 1) % 2;
+    tempo_alternancia_instrucoes = millis();
+  }
+  
+  oled.setCursor(0, 46);
+  if (indice_instrucao_atual == 0) {
+      oled.println("1. Posicione paciente");
+      oled.setCursor(0, 54);
+      oled.println("2. Pressione CADASTRAR");
+  } else {
+      oled.println("Acesse a interface web:");
+      oled.setCursor(0, 54);
+      oled.print("IP: " + ip_address);
+  }
+  oled.display();
+}
+
+void mostrar_tela_alerta() {
+  oled.clearDisplay();
+  desenhar_header_simplificado();
+
+  if (piscar_alerta) {
+    oled.setTextSize(2);
+    oled.setTextColor(WHITE);
+    oled.setCursor(20, 15);
+    oled.println("ALERTA!");
+  }
+  
+  oled.setTextSize(1);
+  oled.setTextColor(WHITE);
+  oled.setCursor(0, 30);
+  String nome_display = paciente_atual.nome_paciente;
+  if (nome_display.length() > 14) nome_display = nome_display.substring(0, 14);
+  oled.print(nome_display);
+  oled.println(" SAIU!");
+  
+  oled.setCursor(0, 38);
+  oled.print("Peso: ");
+  oled.print(String(peso_atual, 1));
+  oled.println(" kg");
+  oled.setCursor(0, 46);
+  oled.print("Limite: ");
+  oled.print(String(paciente_atual.limite_alerta, 1));
+  oled.println(" kg");
+  
+  if (rtc_conectado) {
+    DateTime agora = obter_timestamp_atual();
+    char buff[9];
+    sprintf(buff, "%02d:%02d:%02d", agora.hour(), agora.minute(), agora.second());
+    oled.setCursor(0, 54);
+    oled.print("Hora: ");
+    oled.print(buff);
+  }
+  
+  oled.display();
+}
+
+void mostrar_tela_historico() {
+  oled.clearDisplay();
+  desenhar_header_simplificado();
+  
+  oled.setTextSize(1);
+  oled.setTextColor(WHITE);
+  oled.setCursor(0, 12);
+  oled.print("HISTORICO - ");
+  int total_paginas = total_logs > 0 ? (total_logs + 3) / 4 : 1;
+  oled.print("Pag ");
+  oled.print(pagina_historico + 1);
+  oled.print("/");
+  oled.print(total_paginas);
+  
+  desenhar_linha_horizontal(21);
+  if (total_logs == 0) {
+    oled.setTextSize(1);
+    oled.setCursor(16, 35);
+    oled.println("Nenhum evento");
+  } else {
+    int inicio = pagina_historico * 4;
+    int fim = min(inicio + 4, total_logs);
+    int y_pos = 24;
+    for (int i = inicio; i < fim && y_pos < 50; i++) {
+      int indice_real = (indice_log_atual - 1 - i + 50) % 50;
+      LogEvento evento = logs_eventos[indice_real];
+      
+      oled.setTextSize(1);
+      oled.setCursor(0, y_pos);
+      if (rtc_conectado) {
+        char buff[6];
+        sprintf(buff, "%02d:%02d", evento.timestamp.hour(), evento.timestamp.minute());
+        oled.print(buff); 
+      } else {
+        oled.print("--:--");
+      }
+      
+      oled.setCursor(32, y_pos);
+      String tipo = evento.tipo_evento;
+      if (tipo.length() > 6) tipo = tipo.substring(0, 6);
+      oled.print(tipo);
+      
+      if (evento.peso_relacionado >= 0) {
+        String peso_str = String(evento.peso_relacionado, 1);
+        if (peso_str.length() > 4) peso_str = peso_str.substring(0, 4);
+        int largura_peso = (peso_str + "kg").length() * 6;
+        oled.setCursor(128 - largura_peso, y_pos);
+        oled.print(peso_str + "kg");
+      }
+      y_pos += 9;
+    }
+  }
+  
+  desenhar_linha_horizontal(53);
+  oled.setTextSize(1);
+  oled.setCursor(0, 56);
+  if (total_paginas > 1 && pagina_historico < total_paginas - 1) {
+    oled.print("BOTAO5: Proxima");
+  } else {
+    oled.print("BOTAO5: Sair");
+  }
+  oled.display();
+}
+
+void mostrar_operacao_temporaria(String mensagem, int duracao) {
+  oled.clearDisplay();
+  oled.drawRect(0, 0, 128, 64, WHITE);
+  oled.drawRect(2, 2, 124, 60, WHITE);
+  oled.setTextColor(WHITE);
+
+  if (mensagem.length() > 10) {
+    oled.setTextSize(1);
+    int x = max(0, (128 - ((int)mensagem.length() * 6)) / 2);
+    oled.setCursor(x, 28);
+  } else {
+    oled.setTextSize(2);
+    int x = max(0, (128 - ((int)mensagem.length() * 12)) / 2);
+    oled.setCursor(x, 24);
+  }
+  oled.println(mensagem);
+  oled.display();
+  delay(duracao);
+}
+
+void atualizar_oled() {
+  switch (estado_atual) {
+    case VISUALIZANDO_HISTORICO: mostrar_tela_historico(); break;
+    case ALERTA_ATIVO:
+    case MONITORANDO:
+    case AGUARDANDO:
+      if (paciente_atual.ativo) {
+        if (estado_atual == ALERTA_ATIVO) mostrar_tela_alerta();
+        else mostrar_tela_cadastro();
+      } else {
+        mostrar_tela_inicial();
+      }
+      break;
+  }
+}
+
+void desenhar_linha_horizontal(int y) { oled.drawLine(0, y, 128, y, WHITE); }
+
+void mostrar_tela_boot() {
+  oled.clearDisplay();
+  oled.setTextSize(2);
+  oled.setTextColor(WHITE);
+  oled.setCursor(16, 8);
+  oled.println("HOSPITAL");
+  oled.setCursor(24, 26);
+  oled.println("MONITOR");
+  oled.setTextSize(1);
+  oled.setCursor(32, 48);
+  oled.println("VERSAO 2.1");
+  oled.display();
+  delay(2000);
+}
+
+void mostrar_status_wifi(String status, int progresso) {
+  oled.clearDisplay();
+  oled.setTextSize(2);
+  oled.setTextColor(WHITE);
+  oled.setCursor(32, 8);
+  oled.println("WiFi");
+  oled.setTextSize(1);
+  oled.setCursor(0, 28);
+  
+  String dots = "";
+  if (progresso >= 0) {
+    for (int i=0; i < (progresso % 4); i++) {
+      dots += ".";
+    }
+  }
+  oled.println("Status: " + status + dots);
+  
+  if (progresso >= 0) {
+    oled.drawRect(8, 50, 112, 8, WHITE);
+    int bar_width = map(progresso, 0, 20, 0, 110);
+    if (bar_width > 0) {
+      oled.fillRect(9, 51, bar_width, 6, WHITE);
+    }
+  }
+  oled.display();
+}
+
+void mostrar_status_rtc(String status) {
+  oled.clearDisplay();
+  oled.setTextSize(1);
+  oled.setTextColor(WHITE);
+  oled.setCursor(24, 8);
+  oled.println("RTC DS3231");
+  oled.setCursor(0, 22);
+  oled.println(status);
+  if (rtc_conectado) {
+    DateTime agora = rtc.now();
+    oled.setCursor(0, 35);
+    oled.print("Data: ");
+    oled.println(formatar_data_curta(agora));
+    oled.setCursor(0, 45);
+    oled.print("Hora: ");
+    oled.println(formatar_hora_curta(agora));
+  }
+  oled.display();
+}
+
+void inicializar_rtc() {
+  Serial.println("Inicializando RTC DS3231...");
+  mostrar_status_rtc("Inicializando...");
+  if (!rtc.begin()) {
+    Serial.println("ERRO: RTC DS3231 não encontrado!");
+    rtc_conectado = false;
+    mostrar_status_rtc("ERRO: RTC nao encontrado!");
+    tocar_beep_erro();
+    delay(2000);
+    return;
+  }
+  rtc_conectado = true;
+  Serial.println("✓ RTC DS3231 inicializado");
+
+#if defined(FORCE_RTC_SET)
+    Serial.println("!!! HORA FORÇADAMENTE AJUSTADA PELA COMPILAÇÃO !!!");
+    Serial.println("Comente a linha '#define FORCE_RTC_SET' para operação normal.");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    mostrar_status_rtc("RTC FORCADO!");
+    adicionar_log("SISTEMA", "RTC ajustado via FORCE_RTC_SET");
+#else
+    if (rtc.lostPower()) {
+      Serial.println("RTC perdeu energia, configurando data/hora...");
+      rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+      mostrar_status_rtc("RTC configurado!");
+      adicionar_log("SISTEMA", "RTC configurado com data/hora de compilação");
+    } else {
+      mostrar_status_rtc("RTC conectado!");
+    }
+#endif
+  
+  delay(2000);
+}
+
+// ===== DEFINIÇÃO DA FUNÇÃO CORRIGIDA =====
+// O valor padrão (= -1) foi removido daqui e mantido apenas na declaração.
+void adicionar_log(String tipo, String descricao, float peso) {
+  DateTime timestamp = obter_timestamp_atual();
+  logs_eventos[indice_log_atual] = {timestamp, tipo, descricao, paciente_atual.numero_paciente, peso};
+  Serial.printf("[%s] %s: %s\n", formatar_datetime(timestamp).c_str(), tipo.c_str(), descricao.c_str());
+  
+  indice_log_atual = (indice_log_atual + 1) % 50;
+  if (total_logs < 50) total_logs++;
+}
+
+DateTime obter_timestamp_atual() {
+  return rtc_conectado ? rtc.now() : DateTime(2025, 1, 1, 0, 0, 0) + TimeSpan(millis() / 1000);
+}
+
+String formatar_datetime(DateTime dt) {
+  char buffer[20];
+  sprintf(buffer, "%02d/%02d/%04d %02d:%02d:%02d", dt.day(), dt.month(), dt.year(), dt.hour(), dt.minute(), dt.second());
+  return String(buffer);
+}
+
+String formatar_data_curta(DateTime dt) {
+  char buffer[11];
+  sprintf(buffer, "%02d/%02d/%04d", dt.day(), dt.month(), dt.year());
+  return String(buffer);
+}
+
+String formatar_hora_curta(DateTime dt) {
+  char buffer[9];
+  sprintf(buffer, "%02d:%02d:%02d", dt.hour(), dt.minute(), dt.second());
+  return String(buffer);
+}
+
+void tocar_alerta() { for (int i = 0; i < 3; i++) { tone(BUZZER_PIN, 2000, 300); delay(400); } }
+void tocar_beep_confirmacao() { tone(BUZZER_PIN, 1000, 150); }
+void tocar_beep_duplo() { tone(BUZZER_PIN, 800, 100); delay(200); tone(BUZZER_PIN, 800, 100); }
+void tocar_beep_erro() { for (int i = 0; i < 4; i++) { tone(BUZZER_PIN, 3000, 80); delay(120); } }
+void tocar_beep_navegacao() { tone(BUZZER_PIN, 1500, 100); }
+
+void handleApiTara() {
+  executar_tara();
+  server.send(200, "application/json", "{\"status\":\"ok\",\"mensagem\":\"Tara executada com sucesso\"}");
+}
+
+void handleApiIniciar() {
+  if (paciente_atual.ativo) {
+    alternar_monitoramento();
+    server.send(200, "application/json", "{\"status\":\"ok\",\"mensagem\":\"Monitoramento iniciado\"}");
+  } else {
+    adicionar_log("ERRO", "Tentativa de iniciar monitor via web sem paciente");
+    server.send(400, "application/json", "{\"status\":\"erro\",\"mensagem\":\"Nenhum paciente cadastrado para iniciar\"}");
+  }
+}
+
+void handleApiParar() {
+  alternar_monitoramento();
+  server.send(200, "application/json", "{\"status\":\"ok\",\"mensagem\":\"Monitoramento pausado\"}");
+}
+
+void handleApiFinalizar() {
+  finalizar_sessao();
+  server.send(200, "application/json", "{\"status\":\"ok\",\"mensagem\":\"Sessão finalizada com sucesso\"}");
+}
+
+void handleApiLogs() {
+  DynamicJsonDocument doc(3072);
+  JsonArray logs = doc.to<JsonArray>();
+  int max_logs = min(50, total_logs);
+  for (int i = 0; i < max_logs; i++) {
+    int indice_real = (indice_log_atual - 1 - i + 50) % 50;
+    LogEvento evento = logs_eventos[indice_real];
+    JsonObject log_json = logs.createNestedObject();
+    log_json["timestamp"] = rtc_conectado ? formatar_datetime(evento.timestamp) : "N/A";
+    log_json["tipo"] = evento.tipo_evento;
+    log_json["descricao"] = evento.descricao;
+    log_json["paciente_id"] = evento.paciente_id;
+    log_json["peso"] = evento.peso_relacionado;
+  }
+  String resposta;
+  serializeJson(doc, resposta);
+  server.send(200, "application/json", resposta);
+}
+
+void handleApiExportarEnviarLogs() {
+  String conteudo = "RELATORIO DE LOGS - " + formatar_datetime(obter_timestamp_atual()) + "\n\n";
+  for (int i = 0; i < total_logs; i++) {
+    int indice_real = (indice_log_atual - 1 - i + 50) % 50;
+    LogEvento e = logs_eventos[indice_real];
+    conteudo += formatar_datetime(e.timestamp) + " [" + e.tipo_evento + "] " + e.descricao + "\n";
+  }
+  enviar_email_logs(conteudo);
+  server.send(200, "application/json", "{\"status\":\"ok\",\"mensagem\":\"Comando de envio de e-mail recebido.\"}");
+}
+
+void enviar_email_logs(String conteudo_logs) {
+  if (!wifi_conectado) {
+    adicionar_log("ERRO_EMAIL", "Falha: WiFi desconectado.");
+    return;
+  }
+  adicionar_log("EMAIL", "Iniciando envio de logs...");
+  Session_Config config;
+  config.server.host_name = SMTP_SERVER;
+  config.server.port = SMTP_PORT;
+  config.login.email = EMAIL_SENDER_ACCOUNT;
+  config.login.password = EMAIL_SENDER_PASSWORD;
+  config.login.user_domain = "";
+  config.secure.mode = esp_mail_secure_mode_ssl_tls;
+
+  SMTP_Message message;
+  message.sender.name = "Monitor Hospitalar";
+  message.sender.email = EMAIL_SENDER_ACCOUNT;
+  message.subject = "Relatorio de Logs - " + formatar_datetime(obter_timestamp_atual());
+  message.addRecipient("Destinatario", EMAIL_RECIPIENT);
+  message.text.content = conteudo_logs;
+  
+  smtp.callback(smtpCallback);
+  if (!smtp.connect(&config)) {
+    ESP_MAIL_PRINTF("Connection error, Status: %d, Reason: %s", smtp.statusCode(), smtp.errorReason().c_str());
+    adicionar_log("ERRO_EMAIL", "Falha de conexão com servidor SMTP.");
+    return;
+  }
+  if (!MailClient.sendMail(&smtp, &message, true)) {
+    ESP_MAIL_PRINTF("Error, Status: %d, Reason: %s", smtp.statusCode(), smtp.errorReason().c_str());
+    adicionar_log("ERRO_EMAIL", "Falha no envio: " + smtp.errorReason());
+  }
+}
+
+void smtpCallback(SMTP_Status status) {
+  Serial.println(status.info());
+  if (status.success()) {
+    Serial.println("E-mail enviado com sucesso!");
+    adicionar_log("EMAIL", "Logs enviados para " + String(EMAIL_RECIPIENT));
+  }
+}
